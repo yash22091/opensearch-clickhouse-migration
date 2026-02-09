@@ -1,0 +1,5 @@
+clickhouse-driver
+elasticsearch
+opensearch-py
+python-dotenv
+python-dateutil
