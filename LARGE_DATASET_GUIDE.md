@@ -51,8 +51,8 @@ curl -k -u "$OPENSEARCH_USER:$OPENSEARCH_PASS" \
 
 # Expected output:
 # index                      store.size  docs.count
-# invinsense-alerts-2024-01  25.3gb      50000000
-# invinsense-alerts-2024-02  27.1gb      55000000
+# siem-alerts-2024-01  25.3gb      50000000
+# siem-alerts-2024-02  27.1gb      55000000
 # ...
 ```
 
@@ -276,7 +276,7 @@ OPENSEARCH_HOST=opensearch.example.com
 OPENSEARCH_PORT=9200
 OPENSEARCH_USER=admin
 OPENSEARCH_PASS=password
-OPENSEARCH_INDEX=invinsense-alerts-*
+OPENSEARCH_INDEX=siem-alerts-*
 
 # ClickHouse
 CLICKHOUSE_HOST=localhost
@@ -419,7 +419,7 @@ GROUP BY month
 
 # Compare with OpenSearch
 curl -k -u "$OPENSEARCH_USER:$OPENSEARCH_PASS" \
-  "https://$OPENSEARCH_HOST:$OPENSEARCH_PORT/invinsense-alerts-2024-01/_count"
+  "https://$OPENSEARCH_HOST:$OPENSEARCH_PORT/siem-alerts-2024-01/_count"
 ```
 
 ### 4. Backup migration_summary.json

@@ -51,7 +51,7 @@ This is a **one-time migration tool** designed to migrate historical data from O
 ### Access Requirements:
 - **OpenSearch Access**: Read-only credentials to source OpenSearch instance
   - Host, port, username, password
-  - Access to target index pattern (e.g., `invinsense-alerts-*`)
+  - Access to target index pattern (e.g., `siem-alerts-*`)
 - **ClickHouse Access**: Write permissions to ClickHouse database
   - Host, username, password, database name
   - Ability to create tables and insert data
@@ -106,7 +106,7 @@ OPENSEARCH_HOST=your-opensearch-host
 OPENSEARCH_PORT=9200
 OPENSEARCH_USER=admin
 OPENSEARCH_PASS=your-password
-OPENSEARCH_INDEX=invinsense-alerts-*
+OPENSEARCH_INDEX=siem-alerts-*
 
 # ClickHouse Configuration
 CLICKHOUSE_HOST=your-clickhouse-host

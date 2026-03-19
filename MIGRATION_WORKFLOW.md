@@ -66,7 +66,7 @@ OPENSEARCH_HOST=your-opensearch-host
 OPENSEARCH_PORT=9200
 OPENSEARCH_USER=admin
 OPENSEARCH_PASS=your-password
-OPENSEARCH_INDEX=invinsense-alerts-*
+OPENSEARCH_INDEX=siem-alerts-*
 
 # ClickHouse Configuration
 CLICKHOUSE_HOST=your-clickhouse-host
@@ -135,7 +135,7 @@ OpenSearch to ClickHouse Migration - LIVE MODE
 Started at: 2025-12-30T10:00:00Z
 ================================================================================
 
-Querying OpenSearch index: invinsense-alerts-*
+Querying OpenSearch index: siem-alerts-*
 Time range: {'gt': '1970-01-01T00:00:00Z'}
 
 Progress: 10000 documents processed, 9950 inserted, 50 duplicates skipped

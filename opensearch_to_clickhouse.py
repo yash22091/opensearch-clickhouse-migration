@@ -29,7 +29,7 @@ OPENSEARCH_HOST = os.getenv('OPENSEARCH_HOST')
 OPENSEARCH_PORT = int(os.getenv('OPENSEARCH_PORT', 9200))
 OPENSEARCH_USER = os.getenv('OPENSEARCH_USER')
 OPENSEARCH_PASS = os.getenv('OPENSEARCH_PASS')
-OPENSEARCH_INDEX = os.getenv('OPENSEARCH_INDEX', 'invinsense-alerts-*')
+OPENSEARCH_INDEX = os.getenv('OPENSEARCH_INDEX', 'siem-alerts-*')
 
 SPECIAL_LOCATIONS = [loc.strip() for loc in os.getenv('SPECIAL_LOCATIONS', '').split(',') if loc.strip()]
 BATCH_SIZE = int(os.getenv('BATCH_SIZE', 1000))
