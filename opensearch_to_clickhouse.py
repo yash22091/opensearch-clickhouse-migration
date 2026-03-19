@@ -617,7 +617,7 @@ async def migrate(from_ts=None, to_ts=None, dry_run=False, parallel_workers=None
                         
                         # Save migrated IDs incrementally (append-only for parallel safety)
                         if not USE_BLOOM_FILTER and new_migrated_ids:
-                            save_migrated_ids_batch(new_migrated_ids)
+                            save_migrated_ids(new_migrated_ids, append_only=True)
                             new_migrated_ids = []  # Reset batch
                         
                         logging.info(f"Checkpoint saved at {stats['total_processed']} documents")
@@ -656,7 +656,7 @@ async def migrate(from_ts=None, to_ts=None, dry_run=False, parallel_workers=None
         # Save final migrated IDs (append-only if not using bloom filter)
         if not dry_run:
             if not USE_BLOOM_FILTER and new_migrated_ids:
-                save_migrated_ids_batch(new_migrated_ids)
+                save_migrated_ids(new_migrated_ids, append_only=True)
                 logging.info(f"Saved final batch of {len(new_migrated_ids)} migrated IDs")
             # Note: Bloom filter already tracked IDs during processing
             
