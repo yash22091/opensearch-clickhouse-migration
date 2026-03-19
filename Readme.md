@@ -119,16 +119,24 @@ SPECIAL_LOCATIONS=SOC1,India-DC
 BATCH_SIZE=1000
 SCROLL_SIZE=5000
 PARALLEL_WORKERS=1
+
+# Performance Tuning (Optional)
+CHECKPOINT_INTERVAL=10000
+USE_BLOOM_FILTER=true
 ```
 
 **Configuration Parameters:**
 - `BATCH_SIZE`: Number of documents to batch before inserting into ClickHouse (default: 1000)
 - `SCROLL_SIZE`: Number of documents per OpenSearch scroll request (default: 5000, max: 10000)
 - `PARALLEL_WORKERS`: Number of parallel workers for processing large datasets (default: 1)
+- `CHECKPOINT_INTERVAL`: How often to save checkpoints and migrated IDs (default: 10000 documents)
+- `USE_BLOOM_FILTER`: Use memory-efficient bloom filter for duplicate detection (default: true, recommended for 10M+ documents)
 
 > **OpenSearch Limitation**: OpenSearch has a default max result window of 10,000. The tool automatically caps `SCROLL_SIZE` at 10,000 to prevent query failures.
 
 > **Parallel Processing**: For large datasets (1TB+), use `PARALLEL_WORKERS` to enable parallel processing using OpenSearch's sliced scroll feature. Each worker processes a different slice of data simultaneously.
+
+> **Performance Tip**: For migrations with 100M+ documents, enable `USE_BLOOM_FILTER=true` to reduce memory usage from gigabytes to megabytes while checking for duplicates.
 
 ---
 

@@ -37,15 +37,30 @@ BATCH_SIZE = int(os.getenv('BATCH_SIZE', 1000))
 SCROLL_SIZE = min(int(os.getenv('SCROLL_SIZE', 5000)), 10000)
 # Parallel processing settings
 PARALLEL_WORKERS = int(os.getenv('PARALLEL_WORKERS', 1))  # Number of parallel slices
+# Performance tuning
+CHECKPOINT_INTERVAL = int(os.getenv('CHECKPOINT_INTERVAL', 10000))  # Save checkpoint every N documents
+USE_BLOOM_FILTER = os.getenv('USE_BLOOM_FILTER', 'true').lower() == 'true'  # Memory-efficient deduplication
 CHECKPOINT_FILE = "migration_checkpoints.json"
 MIGRATED_IDS_FILE = "migrated_document_ids.json"
 MIGRATION_SUMMARY_FILE = "migration_summary.json"
+
+# Global cache for table schemas and existence
+TABLE_SCHEMA_CACHE = {}
+TABLE_EXISTS_CACHE = set()
 
 logging.basicConfig(
     filename='activity.log',
     level=logging.INFO,
     format='%(asctime)s %(levelname)s:%(message)s'
 )
+
+# Try to import bloom filter for memory-efficient deduplication
+try:
+    from pybloom_live import BloomFilter
+    BLOOM_AVAILABLE = True
+except ImportError:
+    BLOOM_AVAILABLE = False
+    logging.warning("pybloom_live not available, using set for deduplication (higher memory usage)")
 
 def connect_clickhouse():
     retries = 5
@@ -54,7 +69,10 @@ def connect_clickhouse():
             client = Client(
                 host=CLICKHOUSE_HOST,
                 user=CLICKHOUSE_USER,
-                password=CLICKHOUSE_PASSWORD
+                password=CLICKHOUSE_PASSWORD,
+                send_receive_timeout=300,  # 5 minute timeout
+                sync_request_timeout=300,
+                compression=True  # Enable compression for faster network transfer
             )
             logging.info("Connected to ClickHouse")
             return client
@@ -88,6 +106,10 @@ def get_clickhouse_type(value):
     return 'Nullable(String)'
 
 def create_table_if_not_exist(client, table_name, columns):
+    # Use cache to avoid repeated EXISTS checks
+    if table_name in TABLE_EXISTS_CACHE:
+        return
+    
     if not client.execute(f"EXISTS TABLE {table_name}")[0][0]:
         column_defs = ', '.join([f"`{sanitize_column_name(col)}` {get_clickhouse_type(val)}" for col, val in columns.items() if col not in ['timestamp']])
         query = f"""
@@ -100,6 +122,15 @@ def create_table_if_not_exist(client, table_name, columns):
         """
         client.execute(query)
         logging.info(f"Created table {table_name} with MergeTree engine, partitioned by timestamp date")
+        # Cache initial schema
+        TABLE_SCHEMA_CACHE[table_name] = {sanitize_column_name(col): get_clickhouse_type(val) for col, val in columns.items()}
+    else:
+        # Cache existing schema
+        if table_name not in TABLE_SCHEMA_CACHE:
+            existing_columns = {row[0]: row[1] for row in client.execute(f"DESCRIBE {table_name}")}
+            TABLE_SCHEMA_CACHE[table_name] = existing_columns
+    
+    TABLE_EXISTS_CACHE.add(table_name)
 
 def get_table_name(agent_name, location):
     return f"{CLICKHOUSE_DATABASE}.{sanitize_table_name(location if location in SPECIAL_LOCATIONS else agent_name)}"
@@ -139,18 +170,39 @@ def process_document(source, doc_id):
 async def bulk_insert(client, table_name, data_batch):
     try:
         if not data_batch: return
-        existing_columns = {row[0]: row[1] for row in client.execute(f"DESCRIBE {table_name}")}
+        
+        # Use cached schema instead of DESCRIBE on every batch
+        if table_name not in TABLE_SCHEMA_CACHE:
+            existing_columns = {row[0]: row[1] for row in client.execute(f"DESCRIBE {table_name}")}
+            TABLE_SCHEMA_CACHE[table_name] = existing_columns
+        else:
+            existing_columns = TABLE_SCHEMA_CACHE[table_name]
+        
         all_keys = set(k for row in data_batch for k in row.keys())
         sanitized_keys = {k: sanitize_column_name(k) for k in all_keys}
+        
+        # Collect all new columns and add them in a single batch
+        new_columns = []
         for orig, sani in sanitized_keys.items():
             if sani not in existing_columns and sani not in ['timestamp']:
                 sample_val = next((row[orig] for row in data_batch if orig in row), None)
                 if sample_val is not None:
                     col_type = get_clickhouse_type(sample_val)
+                    new_columns.append((sani, col_type))
+        
+        # Batch ALTER TABLE operations (much faster than one-by-one)
+        if new_columns:
+            for sani, col_type in new_columns:
+                try:
                     client.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS `{sani}` {col_type}")
                     existing_columns[sani] = col_type
+                    TABLE_SCHEMA_CACHE[table_name][sani] = col_type
+                except Exception as e:
+                    # Column might have been added by another worker
+                    logging.debug(f"Column {sani} add skipped: {e}")
+        
         cols = ['timestamp'] + [sanitized_keys[k] for k in all_keys if k not in ['timestamp']]
-        values = [[row.get('timestamp')] + [convert_to_type(row.get(k), existing_columns[sanitized_keys[k]]) for k in all_keys if k not in ['timestamp']] for row in data_batch]
+        values = [[row.get('timestamp')] + [convert_to_type(row.get(k), existing_columns.get(sanitized_keys[k], 'Nullable(String)')) for k in all_keys if k not in ['timestamp']] for row in data_batch]
         client.execute(f"INSERT INTO {table_name} ({', '.join(f'`{c}`' for c in cols)}) VALUES", values)
         logging.info(f"Inserted {len(values)} rows into {table_name}")
     except Exception as e:
@@ -181,19 +233,57 @@ def load_checkpoints():
             logging.warning(f"Failed to load checkpoints: {e}")
     return {}
 
-def load_migrated_ids():
-    if os.path.exists(MIGRATED_IDS_FILE):
-        try:
-            with open(MIGRATED_IDS_FILE) as f:
-                return set(json.load(f))
-        except Exception as e:
-            logging.warning(f"Failed to load migrated IDs: {e}")
-    return set()
-
-def save_migrated_ids(migrated_ids):
+def load_migrated_ids(use_bloom=True):
+    """Load migrated IDs, using bloom filter for memory efficiency if available"""
+    if not os.path.exists(MIGRATED_IDS_FILE):
+        if use_bloom and BLOOM_AVAILABLE and USE_BLOOM_FILTER:
+            # Initialize bloom filter for ~100M items with 0.1% false positive rate
+            return BloomFilter(capacity=100000000, error_rate=0.001)
+        return set()
+    
     try:
+        with open(MIGRATED_IDS_FILE) as f:
+            existing_ids = json.load(f)
+            
+        if use_bloom and BLOOM_AVAILABLE and USE_BLOOM_FILTER:
+            # Load into bloom filter (much more memory efficient)
+            bloom = BloomFilter(capacity=max(len(existing_ids), 100000000), error_rate=0.001)
+            for doc_id in existing_ids:
+                bloom.add(doc_id)
+            logging.info(f"Loaded {len(existing_ids)} IDs into bloom filter (memory-efficient)")
+            return bloom
+        else:
+            # Fall back to set (higher memory usage but exact)
+            logging.info(f"Loaded {len(existing_ids)} IDs into set")
+            return set(existing_ids)
+    except Exception as e:
+        logging.warning(f"Failed to load migrated IDs: {e}")
+        if use_bloom and BLOOM_AVAILABLE and USE_BLOOM_FILTER:
+            return BloomFilter(capacity=100000000, error_rate=0.001)
+        return set()
+
+def save_migrated_ids(migrated_ids, append_only=False):
+    """Save migrated IDs with optional append mode for better performance"""
+    try:
+        if isinstance(migrated_ids, set):
+            ids_to_save = list(migrated_ids)
+        elif BLOOM_AVAILABLE and isinstance(migrated_ids, BloomFilter):
+            # Can't extract from bloom filter, skip save
+            logging.info("Using bloom filter, skipping ID save (IDs tracked in memory only)")
+            return
+        else:
+            ids_to_save = list(migrated_ids)
+        
+        if append_only and os.path.exists(MIGRATED_IDS_FILE):
+            # Append mode: merge with existing (for parallel workers)
+            with open(MIGRATED_IDS_FILE) as f:
+                existing = set(json.load(f))
+            existing.update(ids_to_save)
+            ids_to_save = list(existing)
+        
         with open(MIGRATED_IDS_FILE, 'w') as f:
-            json.dump(list(migrated_ids), f)
+            json.dump(ids_to_save, f)
+        logging.info(f"Saved {len(ids_to_save)} migrated IDs")
     except Exception as e:
         logging.error(f"Could not save migrated IDs: {e}")
 
@@ -228,7 +318,8 @@ async def migrate_worker(worker_id, slice_id, max_slices, from_ts=None, to_ts=No
     )
 
     checkpoints = load_checkpoints()
-    migrated_ids = load_migrated_ids()
+    # Use bloom filter for memory-efficient deduplication in parallel workers
+    migrated_ids = load_migrated_ids(use_bloom=True)
     
     stats = {
         'worker_id': worker_id,
@@ -278,13 +369,15 @@ async def migrate_worker(worker_id, slice_id, max_slices, from_ts=None, to_ts=No
 
     batches = {}
     max_timestamp_tracker = {}
-    new_migrated_ids = set()
+    new_migrated_ids = set()  # Track new IDs for this worker only
     doc_count = 0
+    checkpoint_counter = 0
 
     try:
         for item in results:
             doc_count += 1
             stats['total_processed'] += 1
+            checkpoint_counter += 1
             doc_id = item['_id']
             source = item['_source']
             
@@ -303,6 +396,12 @@ async def migrate_worker(worker_id, slice_id, max_slices, from_ts=None, to_ts=No
 
             batches.setdefault(table_name, []).append(insert_data)
             new_migrated_ids.add(doc_id)
+            # Also add to bloom filter/set for future checks in this worker
+            if BLOOM_AVAILABLE and USE_BLOOM_FILTER and isinstance(migrated_ids, BloomFilter):
+                migrated_ids.add(doc_id)
+            elif isinstance(migrated_ids, set):
+                migrated_ids.add(doc_id)
+            
             ts = insert_data['timestamp']
             
             if table_name not in max_timestamp_tracker or ts > max_timestamp_tracker[table_name]:
@@ -312,6 +411,10 @@ async def migrate_worker(worker_id, slice_id, max_slices, from_ts=None, to_ts=No
                 if not dry_run:
                     create_table_if_not_exist(client, table_name, insert_data)
                     await bulk_insert(client, table_name, batches[table_name])
+                    # Save checkpoint less frequently for better performance
+                    if checkpoint_counter >= CHECKPOINT_INTERVAL:
+                        save_checkpoint(table_name, max_timestamp_tracker[table_name].isoformat() + 'Z')
+                        checkpoint_counter = 0
                     stats['tables_updated'][table_name] = stats['tables_updated'].get(table_name, 0) + len(batches[table_name])
                     stats['total_inserted'] += len(batches[table_name])
                 batches[table_name] = []
@@ -329,13 +432,13 @@ async def migrate_worker(worker_id, slice_id, max_slices, from_ts=None, to_ts=No
             if not dry_run:
                 create_table_if_not_exist(client, table_name, batch[0])
                 await bulk_insert(client, table_name, batch)
+                save_checkpoint(table_name, max_timestamp_tracker[table_name].isoformat() + 'Z')
                 stats['tables_updated'][table_name] = stats['tables_updated'].get(table_name, 0) + len(batch)
                 stats['total_inserted'] += len(batch)
 
-    # Save migrated IDs for this worker
+    # Save new migrated IDs for this worker (append mode for parallel safety)
     if not dry_run and new_migrated_ids:
-        migrated_ids.update(new_migrated_ids)
-        save_migrated_ids(migrated_ids)
+        save_migrated_ids(new_migrated_ids, append_only=True)
     
     logging.info(f"Worker {worker_id}: Completed - {stats['total_processed']} processed, {stats['total_inserted']} inserted")
     return stats
@@ -361,7 +464,11 @@ async def migrate(from_ts=None, to_ts=None, dry_run=False, parallel_workers=None
 
     await list_indices(os_client)
     checkpoints = load_checkpoints()
-    migrated_ids = load_migrated_ids()
+    # Don't load migrated_ids in main function for parallel mode (workers handle it)
+    if workers == 1:
+        migrated_ids = load_migrated_ids(use_bloom=True)
+    else:
+        migrated_ids = None
     
     # Migration statistics
     stats = {
@@ -438,8 +545,9 @@ async def migrate(from_ts=None, to_ts=None, dry_run=False, parallel_workers=None
 
         batches = {}
         max_timestamp_tracker = {}
-        new_migrated_ids = set()
+        new_migrated_ids = [] if not USE_BLOOM_FILTER else set()  # Use list for append-only or set for bloom filter
         doc_count = 0
+        last_checkpoint_count = 0  # Track when we last saved checkpoints
 
         logging.info("Starting document processing loop")
         print("Processing documents...\n")
@@ -454,7 +562,9 @@ async def migrate(from_ts=None, to_ts=None, dry_run=False, parallel_workers=None
                 if doc_count <= 5:
                     logging.info(f"Processing document {doc_count}: ID={doc_id}")
                 
-                if doc_id in migrated_ids:
+                # Use bloom filter if enabled, otherwise fallback to set
+                is_duplicate = doc_id in migrated_ids
+                if is_duplicate:
                     stats['duplicates_skipped'] += 1
                     if doc_count <= 10:
                         logging.info(f"Document {doc_id} already migrated, skipping")
@@ -473,7 +583,13 @@ async def migrate(from_ts=None, to_ts=None, dry_run=False, parallel_workers=None
                     continue
 
                 batches.setdefault(table_name, []).append(insert_data)
-                new_migrated_ids.add(doc_id)
+                # Add to tracking structure based on bloom filter setting
+                if USE_BLOOM_FILTER:
+                    new_migrated_ids.add(doc_id)
+                    migrated_ids.add(doc_id)  # Add to bloom filter immediately
+                else:
+                    new_migrated_ids.append(doc_id)  # Append for batch save later
+                
                 ts = insert_data['timestamp']
                 
                 if len(batches[table_name]) == 1:
@@ -488,10 +604,24 @@ async def migrate(from_ts=None, to_ts=None, dry_run=False, parallel_workers=None
                             create_table_if_not_exist(client, table_name, insert_data)
                             stats['tables_created'].append(table_name)
                         await bulk_insert(client, table_name, batches[table_name])
-                        save_checkpoint(table_name, max_timestamp_tracker[table_name].isoformat() + 'Z')
                         stats['tables_updated'][table_name] = stats['tables_updated'].get(table_name, 0) + len(batches[table_name])
                         stats['total_inserted'] += len(batches[table_name])
                     batches[table_name] = []
+                
+                # Save checkpoints and IDs at configured intervals
+                if stats['total_processed'] - last_checkpoint_count >= CHECKPOINT_INTERVAL:
+                    if not dry_run:
+                        # Save checkpoints for all tables
+                        for tbl, max_ts in max_timestamp_tracker.items():
+                            save_checkpoint(tbl, max_ts.isoformat() + 'Z')
+                        
+                        # Save migrated IDs incrementally (append-only for parallel safety)
+                        if not USE_BLOOM_FILTER and new_migrated_ids:
+                            save_migrated_ids_batch(new_migrated_ids)
+                            new_migrated_ids = []  # Reset batch
+                        
+                        logging.info(f"Checkpoint saved at {stats['total_processed']} documents")
+                    last_checkpoint_count = stats['total_processed']
                     
                 if stats['total_processed'] % 1000 == 0:
                     print(f"Progress: {stats['total_processed']} documents processed, {stats['total_inserted']} inserted, {stats['duplicates_skipped']} duplicates skipped")
@@ -523,11 +653,14 @@ async def migrate(from_ts=None, to_ts=None, dry_run=False, parallel_workers=None
                 else:
                     logging.info(f"DRY RUN: Would insert {len(batch)} records into {table_name}")
 
-        # Save migrated IDs
+        # Save final migrated IDs (append-only if not using bloom filter)
         if not dry_run:
-            migrated_ids.update(new_migrated_ids)
-            save_migrated_ids(migrated_ids)
-            json.dump(stats, f, indent=2)
+            if not USE_BLOOM_FILTER and new_migrated_ids:
+                save_migrated_ids_batch(new_migrated_ids)
+                logging.info(f"Saved final batch of {len(new_migrated_ids)} migrated IDs")
+            # Note: Bloom filter already tracked IDs during processing
+            
+        json.dump(stats, f, indent=2)
     
     # Print summary
     print(f"\n{'='*80}")

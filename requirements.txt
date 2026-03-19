@@ -3,3 +3,4 @@ elasticsearch
 opensearch-py
 python-dotenv
 python-dateutil
+pybloom_live
