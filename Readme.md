@@ -26,6 +26,7 @@ This is a **one-time migration tool** designed to migrate historical data from O
 ## Features
 
 - **One-time migration** with duplicate prevention (tracks document IDs in migration files)
+- **Parallel processing** for large datasets using OpenSearch sliced scroll (1TB+ support)
 - **Agent-wise tables**: Separate tables per agent (e.g., `wazuh_agent`)
 - **Location-wise tables**: Special tables for configured locations (SOC1, India-DC, etc.)
 - **Daily partitioning**: Tables partitioned by `ingestion_date` (like Elasticsearch daily indices)
@@ -117,13 +118,17 @@ CLICKHOUSE_DATABASE=default
 SPECIAL_LOCATIONS=SOC1,India-DC
 BATCH_SIZE=1000
 SCROLL_SIZE=5000
+PARALLEL_WORKERS=1
 ```
 
 **Configuration Parameters:**
 - `BATCH_SIZE`: Number of documents to batch before inserting into ClickHouse (default: 1000)
 - `SCROLL_SIZE`: Number of documents per OpenSearch scroll request (default: 5000, max: 10000)
+- `PARALLEL_WORKERS`: Number of parallel workers for processing large datasets (default: 1)
 
 > **OpenSearch Limitation**: OpenSearch has a default max result window of 10,000. The tool automatically caps `SCROLL_SIZE` at 10,000 to prevent query failures.
+
+> **Parallel Processing**: For large datasets (1TB+), use `PARALLEL_WORKERS` to enable parallel processing using OpenSearch's sliced scroll feature. Each worker processes a different slice of data simultaneously.
 
 ---
 
@@ -157,7 +162,15 @@ python opensearch_to_clickhouse.py
 
 # Or migrate specific time range
 python opensearch_to_clickhouse.py --from "2024-01-01T00:00:00Z" --to "2024-12-31T23:59:59Z"
+
+# For large datasets (1TB+), use parallel workers
+python opensearch_to_clickhouse.py --workers 4
+
+# Combine time range and parallel workers
+python opensearch_to_clickhouse.py --from "2024-01-01T00:00:00Z" --to "2024-12-31T23:59:59Z" --workers 8
 ```
+
+> **Performance Tip**: For datasets over 1TB or indices with 20-30GB+ each, use `--workers` option. Start with 4-8 workers and increase based on server resources.
 
 ### Step 4: Monitor Progress
 
@@ -303,6 +316,14 @@ After migration, check `migration_summary.json`:
 - Monitor `activity.log` for errors or performance issues
 - Use `--dry-run` first to estimate migration time
 
+**For Large Datasets (1TB+ or 20-30GB per index):**
+- Use parallel workers: `--workers 4` (or 8, 16 depending on server resources)
+- Parallel processing uses OpenSearch's sliced scroll feature (no 10K limit per slice)
+- Each worker processes a different slice simultaneously, dramatically reducing migration time
+- Recommended: 1 worker per 2-4 CPU cores available on ClickHouse server
+- Example: `python opensearch_to_clickhouse.py --workers 8 --from "2024-01-01T00:00:00Z"`
+- Monitor CPU and memory usage, adjust worker count accordingly
+
 ### OpenSearch Limitations
 - **Max Result Window**: OpenSearch has a default `max_result_window` of 10,000 documents per scroll request
 - **SCROLL_SIZE vs BATCH_SIZE**: 
@@ -314,6 +335,11 @@ After migration, check `migration_summary.json`:
   - Create memory pressure on ClickHouse
   - Reduce migration progress visibility
 - **Recommended**: Keep `BATCH_SIZE` between 1000-5000, use `SCROLL_SIZE` for query optimization
+- **Sliced Scroll for Large Datasets**: When using `--workers > 1`, the tool uses OpenSearch's sliced scroll feature:
+  - Bypasses the 10K scroll window limitation by splitting data into parallel slices
+  - Each worker processes its own slice independently
+  - Ideal for multi-TB datasets with billions of documents
+  - Example: `--workers 8` splits data into 8 slices processed simultaneously
 
 ---
 
@@ -384,6 +410,15 @@ python opensearch_to_clickhouse.py
 
 # Time range migration
 python opensearch_to_clickhouse.py \
+  --from "2024-01-01T00:00:00Z" \
+  --to "2024-12-31T23:59:59Z"
+
+# Parallel processing for large datasets
+python opensearch_to_clickhouse.py --workers 4
+
+# Parallel with time range
+python opensearch_to_clickhouse.py \
+  --workers 8 \
   --from "2024-01-01T00:00:00Z" \
   --to "2024-12-31T23:59:59Z"
 
@@ -458,6 +493,7 @@ This tool is ideal for:
 ## Documentation
 
 - **[MIGRATION_WORKFLOW.md](MIGRATION_WORKFLOW.md)** - Detailed step-by-step migration guide, Phase 1 vs Phase 2 comparison, troubleshooting, and best practices
+- **[LARGE_DATASET_GUIDE.md](LARGE_DATASET_GUIDE.md)** - Optimizing migration for 1TB+ datasets using parallel processing, chunking strategies, and performance tuning
 
 ---
 
@@ -502,6 +538,37 @@ If you see `0` documents migrated but OpenSearch has data:
 - **Error**: "Code: 241 - Memory limit exceeded"
   - **Cause**: `BATCH_SIZE` too large or documents too big
   - **Solution**: Reduce `BATCH_SIZE` to 500 or 250
+
+### Migration Too Slow for Large Datasets (1TB+)
+
+- **Problem**: Migration taking days/weeks for multi-TB datasets
+- **Cause**: Sequential scroll processing is slow for billions of documents
+- **Solution**: Use parallel workers with sliced scroll
+  ```bash
+  # Start with 4-8 workers
+  python opensearch_to_clickhouse.py --workers 8
+  
+  # Monitor system resources and scale up
+  htop  # Check CPU usage
+  
+  # Increase workers if CPU < 80%
+  python opensearch_to_clickhouse.py --workers 16
+  ```
+- **Guidelines**:
+  - 1-2 workers per CPU core available
+  - Monitor ClickHouse server load
+  - Test with `--dry-run --workers 4` first
+  - Each worker maintains its own migrated IDs tracking
+  
+### OpenSearch Connection Timeout with Parallel Workers
+
+- **Problem**: Connection errors when using many workers
+- **Cause**: Too many concurrent connections to OpenSearch
+- **Solution**: Balance workers with OpenSearch capacity
+  ```bash
+  # Reduce workers or increase OpenSearch connection pool
+  python opensearch_to_clickhouse.py --workers 4  # Instead of 16
+  ```
 
 ---
 

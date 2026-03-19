@@ -35,6 +35,8 @@ SPECIAL_LOCATIONS = [loc.strip() for loc in os.getenv('SPECIAL_LOCATIONS', '').s
 BATCH_SIZE = int(os.getenv('BATCH_SIZE', 1000))
 # OpenSearch has a max result window, cap scroll size at 10000
 SCROLL_SIZE = min(int(os.getenv('SCROLL_SIZE', 5000)), 10000)
+# Parallel processing settings
+PARALLEL_WORKERS = int(os.getenv('PARALLEL_WORKERS', 1))  # Number of parallel slices
 CHECKPOINT_FILE = "migration_checkpoints.json"
 MIGRATED_IDS_FILE = "migrated_document_ids.json"
 MIGRATION_SUMMARY_FILE = "migration_summary.json"
@@ -215,11 +217,138 @@ def reset_checkpoints():
         os.remove(MIGRATION_SUMMARY_FILE)
         logging.info("Migration summary reset")
 
-async def migrate(from_ts=None, to_ts=None, dry_run=False):
+async def migrate_worker(worker_id, slice_id, max_slices, from_ts=None, to_ts=None, dry_run=False):
+    """Worker function for parallel processing using sliced scroll"""
+    client = connect_clickhouse()
+    os_client = OpenSearch(
+        hosts=[{"host": OPENSEARCH_HOST, "port": OPENSEARCH_PORT}],
+        http_auth=(OPENSEARCH_USER, OPENSEARCH_PASS),
+        use_ssl=True,
+        verify_certs=False
+    )
+
+    checkpoints = load_checkpoints()
+    migrated_ids = load_migrated_ids()
+    
+    stats = {
+        'worker_id': worker_id,
+        'total_processed': 0,
+        'total_inserted': 0,
+        'duplicates_skipped': 0,
+        'errors': 0,
+        'tables_updated': {}
+    }
+
+    range_query = {"gt": from_ts or "1970-01-01T00:00:00Z"}
+    if to_ts:
+        range_query["lt"] = to_ts
+
+    # Use sliced scroll for parallel processing
+    query = {
+        "query": {
+            "range": {"@timestamp": range_query}
+        },
+        "slice": {
+            "id": slice_id,
+            "max": max_slices
+        }
+    }
+    
+    logging.info(f"Worker {worker_id} (slice {slice_id}/{max_slices}) starting")
+    
+    try:
+        results = scan(
+            client=os_client,
+            index=OPENSEARCH_INDEX,
+            query=query,
+            scroll="5m",
+            size=SCROLL_SIZE,
+            preserve_order=False,  # Not needed for sliced scroll
+            raise_on_error=False
+        )
+        logging.info(f"Worker {worker_id}: OpenSearch scan initialized successfully")
+    except ScanError as e:
+        logging.error(f"Worker {worker_id}: Scan failure: {e}")
+        stats['errors'] += 1
+        return stats
+    except Exception as e:
+        logging.error(f"Worker {worker_id}: Failed to initialize scan: {e}")
+        stats['errors'] += 1
+        return stats
+
+    batches = {}
+    max_timestamp_tracker = {}
+    new_migrated_ids = set()
+    doc_count = 0
+
+    try:
+        for item in results:
+            doc_count += 1
+            stats['total_processed'] += 1
+            doc_id = item['_id']
+            source = item['_source']
+            
+            if doc_id in migrated_ids:
+                stats['duplicates_skipped'] += 1
+                continue
+            
+            table_name, insert_data, doc_ts = process_document(source, doc_id)
+            if not table_name or not insert_data or not doc_ts:
+                stats['errors'] += 1
+                continue
+
+            last_cp_ts = checkpoints.get(table_name, "1970-01-01T00:00:00Z")
+            if doc_ts <= last_cp_ts:
+                continue
+
+            batches.setdefault(table_name, []).append(insert_data)
+            new_migrated_ids.add(doc_id)
+            ts = insert_data['timestamp']
+            
+            if table_name not in max_timestamp_tracker or ts > max_timestamp_tracker[table_name]:
+                max_timestamp_tracker[table_name] = ts
+                
+            if len(batches[table_name]) >= BATCH_SIZE:
+                if not dry_run:
+                    create_table_if_not_exist(client, table_name, insert_data)
+                    await bulk_insert(client, table_name, batches[table_name])
+                    stats['tables_updated'][table_name] = stats['tables_updated'].get(table_name, 0) + len(batches[table_name])
+                    stats['total_inserted'] += len(batches[table_name])
+                batches[table_name] = []
+                
+            if stats['total_processed'] % 1000 == 0:
+                logging.info(f"Worker {worker_id}: {stats['total_processed']} processed, {stats['total_inserted']} inserted")
+
+    except Exception as e:
+        logging.error(f"Worker {worker_id}: Error during processing: {e}")
+        stats['errors'] += 1
+
+    # Insert remaining batches
+    for table_name, batch in batches.items():
+        if batch:
+            if not dry_run:
+                create_table_if_not_exist(client, table_name, batch[0])
+                await bulk_insert(client, table_name, batch)
+                stats['tables_updated'][table_name] = stats['tables_updated'].get(table_name, 0) + len(batch)
+                stats['total_inserted'] += len(batch)
+
+    # Save migrated IDs for this worker
+    if not dry_run and new_migrated_ids:
+        migrated_ids.update(new_migrated_ids)
+        save_migrated_ids(migrated_ids)
+    
+    logging.info(f"Worker {worker_id}: Completed - {stats['total_processed']} processed, {stats['total_inserted']} inserted")
+    return stats
+
+
+async def migrate(from_ts=None, to_ts=None, dry_run=False, parallel_workers=None):
     start_time = datetime.now(timezone.utc)
+    workers = parallel_workers or PARALLEL_WORKERS
+    
     print(f"\n{'='*80}")
     print(f"OpenSearch to ClickHouse Migration - {'DRY RUN' if dry_run else 'LIVE MODE'}")
     print(f"Started at: {start_time.isoformat()}")
+    print(f"Parallel Workers: {workers}")
     print(f"{'='*80}\n")
     
     client = connect_clickhouse()
@@ -243,151 +372,161 @@ async def migrate(from_ts=None, to_ts=None, dry_run=False):
         'tables_created': [],
         'tables_updated': {},
         'start_time': start_time.isoformat(),
-        'time_range': {'from': from_ts or '1970-01-01T00:00:00Z', 'to': to_ts or 'NOW'}
+        'time_range': {'from': from_ts or '1970-01-01T00:00:00Z', 'to': to_ts or 'NOW'},
+        'parallel_workers': workers
     }
 
-    range_query = {"gt": from_ts or "1970-01-01T00:00:00Z"}
-    if to_ts:
-        range_query["lt"] = to_ts
-
-    # Use must with @timestamp as primary field
-    query = {
-        "query": {
-            "range": {"@timestamp": range_query}
-        }
-    }
-    
     print(f"Querying OpenSearch index: {OPENSEARCH_INDEX}")
-    print(f"Time range: {range_query}")
+    print(f"Time range: {stats['time_range']}")
     print(f"Scroll size: {SCROLL_SIZE}, Batch insert size: {BATCH_SIZE}\n")
+    print(f"Processing with {workers} parallel worker(s)...\n")
     
-    logging.info(f"Starting migration - Index: {OPENSEARCH_INDEX}, Time range: {range_query}")
+    logging.info(f"Starting migration - Index: {OPENSEARCH_INDEX}, Workers: {workers}")
     
-    try:
-        results = scan(
-            client=os_client,
-            index=OPENSEARCH_INDEX,
-            query=query,
-            scroll="5m",
-            size=SCROLL_SIZE,  # Use SCROLL_SIZE instead of BATCH_SIZE
-            preserve_order=True,
-            raise_on_error=False
-        )
-        logging.info("OpenSearch scan initialized successfully")
-    except ScanError as e:
-        logging.error(f"Partial scan failure: {e}")
-        stats['errors'] += 1
-        return stats
-    except Exception as e:
-        logging.error(f"Failed to initialize OpenSearch scan: {e}")
-        stats['errors'] += 1
-        return stats
+    if workers > 1:
+        # Parallel processing using sliced scroll
+        tasks = []
+        for i in range(workers):
+            task = migrate_worker(i, i, workers, from_ts, to_ts, dry_run)
+            tasks.append(task)
+        
+        worker_results = await asyncio.gather(*tasks)
+        
+        # Aggregate results from all workers
+        for worker_stats in worker_results:
+            stats['total_processed'] += worker_stats['total_processed']
+            stats['total_inserted'] += worker_stats['total_inserted']
+            stats['duplicates_skipped'] += worker_stats['duplicates_skipped']
+            stats['errors'] += worker_stats['errors']
+            for table, count in worker_stats['tables_updated'].items():
+                stats['tables_updated'][table] = stats['tables_updated'].get(table, 0) + count
+                if table not in stats['tables_created']:
+                    stats['tables_created'].append(table)
+    else:
+        # Single worker mode (original logic)
+        range_query = {"gt": from_ts or "1970-01-01T00:00:00Z"}
+        if to_ts:
+            range_query["lt"] = to_ts
 
-    batches = {}
-    max_timestamp_tracker = {}
-    new_migrated_ids = set()
-    doc_count = 0
-
-    logging.info("Starting document processing loop")
-    print("Processing documents...\n")
-    
-    try:
-        for item in results:
-            doc_count += 1
-            stats['total_processed'] += 1
-        doc_id = item['_id']
-        source = item['_source']
+        query = {
+            "query": {
+                "range": {"@timestamp": range_query}
+            }
+        }
         
-        # Log first few documents for debugging
-        if doc_count <= 5:
-            logging.info(f"Processing document {doc_count}: ID={doc_id}")
+        logging.info(f"Starting migration - Index: {OPENSEARCH_INDEX}, Time range: {range_query}")
         
-        # Skip if already migrated
-        if doc_id in migrated_ids:
-            stats['duplicates_skipped'] += 1
-            if doc_count <= 10:
-                logging.info(f"Document {doc_id} already migrated, skipping")
-            continue
-        
-        table_name, insert_data, doc_ts = process_document(source, doc_id)
-        if not table_name or not insert_data or not doc_ts:
+        try:
+            results = scan(
+                client=os_client,
+                index=OPENSEARCH_INDEX,
+                query=query,
+                scroll="5m",
+                size=SCROLL_SIZE,
+                preserve_order=True,
+                raise_on_error=False
+            )
+            logging.info("OpenSearch scan initialized successfully")
+        except ScanError as e:
+            logging.error(f"Partial scan failure: {e}")
             stats['errors'] += 1
-            logging.warning(f"Failed to process document {doc_id}")
-            continue
+            return stats
+        except Exception as e:
+            logging.error(f"Failed to initialize OpenSearch scan: {e}")
+            stats['errors'] += 1
+            return stats
 
-        last_cp_ts = checkpoints.get(table_name, "1970-01-01T00:00:00Z")
-        if doc_ts <= last_cp_ts:
-            if doc_count <= 10:
-                logging.info(f"Document {doc_id} timestamp {doc_ts} <= checkpoint {last_cp_ts}, skipping")
-            continue
+        batches = {}
+        max_timestamp_tracker = {}
+        new_migrated_ids = set()
+        doc_count = 0
 
-        batches.setdefault(table_name, []).append(insert_data)
-        new_migrated_ids.add(doc_id)
-        ts = insert_data['timestamp']
+        logging.info("Starting document processing loop")
+        print("Processing documents...\n")
         
-        # Log batch progress
-        if len(batches[table_name]) == 1:
-            logging.info(f"Started new batch for table {table_name}")
+        try:
+            for item in results:
+                doc_count += 1
+                stats['total_processed'] += 1
+                doc_id = item['_id']
+                source = item['_source']
+                
+                if doc_count <= 5:
+                    logging.info(f"Processing document {doc_count}: ID={doc_id}")
+                
+                if doc_id in migrated_ids:
+                    stats['duplicates_skipped'] += 1
+                    if doc_count <= 10:
+                        logging.info(f"Document {doc_id} already migrated, skipping")
+                    continue
+                
+                table_name, insert_data, doc_ts = process_document(source, doc_id)
+                if not table_name or not insert_data or not doc_ts:
+                    stats['errors'] += 1
+                    logging.warning(f"Failed to process document {doc_id}")
+                    continue
+
+                last_cp_ts = checkpoints.get(table_name, "1970-01-01T00:00:00Z")
+                if doc_ts <= last_cp_ts:
+                    if doc_count <= 10:
+                        logging.info(f"Document {doc_id} timestamp {doc_ts} <= checkpoint {last_cp_ts}, skipping")
+                    continue
+
+                batches.setdefault(table_name, []).append(insert_data)
+                new_migrated_ids.add(doc_id)
+                ts = insert_data['timestamp']
+                
+                if len(batches[table_name]) == 1:
+                    logging.info(f"Started new batch for table {table_name}")
+                
+                if table_name not in max_timestamp_tracker or ts > max_timestamp_tracker[table_name]:
+                    max_timestamp_tracker[table_name] = ts
+                    
+                if len(batches[table_name]) >= BATCH_SIZE:
+                    if not dry_run:
+                        if table_name not in stats['tables_created']:
+                            create_table_if_not_exist(client, table_name, insert_data)
+                            stats['tables_created'].append(table_name)
+                        await bulk_insert(client, table_name, batches[table_name])
+                        save_checkpoint(table_name, max_timestamp_tracker[table_name].isoformat() + 'Z')
+                        stats['tables_updated'][table_name] = stats['tables_updated'].get(table_name, 0) + len(batches[table_name])
+                        stats['total_inserted'] += len(batches[table_name])
+                    batches[table_name] = []
+                    
+                if stats['total_processed'] % 1000 == 0:
+                    print(f"Progress: {stats['total_processed']} documents processed, {stats['total_inserted']} inserted, {stats['duplicates_skipped']} duplicates skipped")
+                    logging.info(f"Progress: {stats['total_processed']} processed, {len(batches)} tables with pending batches")
+
+        except Exception as e:
+            logging.error(f"Error during document processing: {e}")
+            print(f"Error processing documents: {e}")
+            stats['errors'] += 1
+
+        logging.info(f"Document scan completed: {doc_count} total documents retrieved from OpenSearch")
+        print(f"\nDocument scan completed: {doc_count} documents retrieved from OpenSearch\n")
         
-        if table_name not in max_timestamp_tracker or ts > max_timestamp_tracker[table_name]:
-            max_timestamp_tracker[table_name] = ts
-            
-        if len(batches[table_name]) >= BATCH_SIZE:
-            if not dry_run:
-                if table_name not in stats['tables_created']:
-                    create_table_if_not_exist(client, table_name, insert_data)
-                    stats['tables_created'].append(table_name)
-                await bulk_insert(client, table_name, batches[table_name])
-                save_checkpoint(table_name, max_timestamp_tracker[table_name].isoformat() + 'Z')
-                stats['tables_updated'][table_name] = stats['tables_updated'].get(table_name, 0) + len(batches[table_name])
-                stats['total_inserted'] += len(batches[table_name])
-            batches[table_name] = []
-            
-        # Progress reporting every 1000 documents
-        if stats['total_processed'] % 1000 == 0:
-            print(f"Progress: {stats['total_processed']} documents processed, {stats['total_inserted']} inserted, {stats['duplicates_skipped']} duplicates skipped")
-            logging.info(f"Progress: {stats['total_processed']} processed, {len(batches)} tables with pending batches")
+        # Insert remaining batches
+        print(f"\nInserting remaining batches for {len(batches)} tables...")
+        logging.info(f"Processing remaining batches: {len(batches)} tables with pending data")
+        
+        for table_name, batch in batches.items():
+            if batch:
+                logging.info(f"Inserting remaining {len(batch)} records into {table_name}")
+                if not dry_run:
+                    if table_name not in stats['tables_created']:
+                        create_table_if_not_exist(client, table_name, batch[0])
+                        stats['tables_created'].append(table_name)
+                    await bulk_insert(client, table_name, batch)
+                    save_checkpoint(table_name, max_timestamp_tracker[table_name].isoformat() + 'Z')
+                    stats['tables_updated'][table_name] = stats['tables_updated'].get(table_name, 0) + len(batch)
+                    stats['total_inserted'] += len(batch)
+                else:
+                    logging.info(f"DRY RUN: Would insert {len(batch)} records into {table_name}")
 
-    except Exception as e:
-        logging.error(f"Error during document processing: {e}")
-        print(f"Error processing documents: {e}")
-        stats['errors'] += 1
-
-    # Log completion of scan
-    logging.info(f"Document scan completed: {doc_count} total documents retrieved from OpenSearch")
-    print(f"\nDocument scan completed: {doc_count} documents retrieved from OpenSearch\n")
-    
-    # Insert remaining batches
-    print(f"\nInserting remaining batches for {len(batches)} tables...")
-    logging.info(f"Processing remaining batches: {len(batches)} tables with pending data")
-    
-    for table_name, batch in batches.items():
-        if batch:
-            logging.info(f"Inserting remaining {len(batch)} records into {table_name}")
-            if not dry_run:
-                if table_name not in stats['tables_created']:
-                    create_table_if_not_exist(client, table_name, batch[0])
-                    stats['tables_created'].append(table_name)
-                await bulk_insert(client, table_name, batch)
-                save_checkpoint(table_name, max_timestamp_tracker[table_name].isoformat() + 'Z')
-                stats['tables_updated'][table_name] = stats['tables_updated'].get(table_name, 0) + len(batch)
-                stats['total_inserted'] += len(batch)
-            else:
-                logging.info(f"DRY RUN: Would insert {len(batch)} records into {table_name}")
-
-    # Save migrated IDs
-    if not dry_run:
-        migrated_ids.update(new_migrated_ids)
-        save_migrated_ids(migrated_ids)
-    
-    end_time = datetime.now(timezone.utc)
-    duration = (end_time - start_time).total_seconds()
-    stats['end_time'] = end_time.isoformat()
-    stats['duration_seconds'] = duration
-    
-    # Save summary
-    if not dry_run:
-        with open(MIGRATION_SUMMARY_FILE, 'w') as f:
+        # Save migrated IDs
+        if not dry_run:
+            migrated_ids.update(new_migrated_ids)
+            save_migrated_ids(migrated_ids)
             json.dump(stats, f, indent=2)
     
     # Print summary
@@ -421,10 +560,12 @@ if __name__ == "__main__":
                         help="End timestamp (ISO format: 2024-12-31T23:59:59Z)")
     parser.add_argument("--dry-run", action="store_true", 
                         help="Test migration without inserting data")
+    parser.add_argument("--workers", type=int, dest="workers",
+                        help="Number of parallel workers for processing (default: 1, uses sliced scroll)")
     args = parser.parse_args()
 
     if args.reset_checkpoints:
         reset_checkpoints()
         print("All migration checkpoints and tracked IDs have been reset.")
     else:
-        asyncio.run(migrate(from_ts=args.from_ts, to_ts=args.to_ts, dry_run=args.dry_run))
+        asyncio.run(migrate(from_ts=args.from_ts, to_ts=args.to_ts, dry_run=args.dry_run, parallel_workers=args.workers))
